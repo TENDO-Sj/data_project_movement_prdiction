@@ -11,7 +11,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
-from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
 # ─────────────────────────── 기본 설정 ───────────────────────────
@@ -150,12 +150,25 @@ def preprocess(data: pd.DataFrame, drop_dup: bool, outlier: str, k: float) -> pd
 # ─────────────────────────── 모델 ───────────────────────────
 @st.cache_resource(show_spinner="모델을 학습하는 중...")
 def train_model(test_size: float, n_trees: int, drop_dup: bool, outlier: str, k: float):
-    df = preprocess(load_data(), drop_dup, outlier, k)
+    df = clean_basic(load_data())
+    if drop_dup:
+        df = df.drop_duplicates(subset=SENSORS + ["Class"])
     X = df[SENSORS]
     y = df["Class"].astype(int)
     X_tr, X_te, y_tr, y_te = train_test_split(
         X, y, test_size=test_size, random_state=42, stratify=y
     )
+    # 이상치: train에서만 IQR 경계 계산 → 양쪽 적용 (누수 방지)
+    if outlier != OUTLIER_MODES[0]:
+        lo, hi = iqr_bounds(X_tr, k)
+        if outlier == OUTLIER_MODES[1]:  # 제거
+            keep_tr = ~((X_tr < lo) | (X_tr > hi)).any(axis=1)
+            X_tr, y_tr = X_tr[keep_tr], y_tr[keep_tr]
+            keep_te = ~((X_te < lo) | (X_te > hi)).any(axis=1)
+            X_te, y_te = X_te[keep_te], y_te[keep_te]
+        else:  # clip
+            X_tr = X_tr.clip(lower=lo, upper=hi, axis=1)
+            X_te = X_te.clip(lower=lo, upper=hi, axis=1)
     model = RandomForestClassifier(n_estimators=n_trees, random_state=42, n_jobs=-1)
     model.fit(X_tr, y_tr)
     pred = model.predict(X_te)
@@ -164,10 +177,29 @@ def train_model(test_size: float, n_trees: int, drop_dup: bool, outlier: str, k:
 
 @st.cache_data(show_spinner="교차 검증 중...")
 def cross_validate(n_trees: int, n_folds: int, drop_dup: bool, outlier: str, k: float):
-    data = preprocess(load_data(), drop_dup, outlier, k)
-    X, y = data[SENSORS], data["Class"].astype(int)
-    rf = RandomForestClassifier(n_estimators=n_trees, random_state=42, n_jobs=-1)
-    return cross_val_score(rf, X, y, cv=n_folds, scoring="accuracy")
+    df = clean_basic(load_data())
+    if drop_dup:
+        df = df.drop_duplicates(subset=SENSORS + ["Class"])
+    X, y = df[SENSORS], df["Class"].astype(int)
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+    scores = []
+    for tr_idx, te_idx in skf.split(X, y):
+        Xtr, Xte = X.iloc[tr_idx].copy(), X.iloc[te_idx].copy()
+        ytr, yte = y.iloc[tr_idx], y.iloc[te_idx]
+        if outlier != OUTLIER_MODES[0]:
+            lo, hi = iqr_bounds(Xtr, k)
+            if outlier == OUTLIER_MODES[1]:
+                keep = ~((Xtr < lo) | (Xtr > hi)).any(axis=1)
+                Xtr, ytr = Xtr[keep], ytr[keep]
+                keep_te = ~((Xte < lo) | (Xte > hi)).any(axis=1)
+                Xte, yte = Xte[keep_te], yte[keep_te]
+            else:
+                Xtr = Xtr.clip(lower=lo, upper=hi, axis=1)
+                Xte = Xte.clip(lower=lo, upper=hi, axis=1)
+        rf = RandomForestClassifier(n_estimators=n_trees, random_state=42, n_jobs=-1)
+        rf.fit(Xtr, ytr)
+        scores.append(rf.score(Xte, yte))
+    return pd.Series(scores)
 
 
 def polar_chart(values: pd.Series, title: str) -> go.Figure:
