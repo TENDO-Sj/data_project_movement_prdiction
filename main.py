@@ -10,8 +10,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, confusion_matrix
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_recall_fscore_support
+from sklearn.model_selection import cross_val_score, train_test_split
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
 # ─────────────────────────── 기본 설정 ───────────────────────────
@@ -160,6 +160,14 @@ def train_model(test_size: float, n_trees: int, drop_dup: bool, outlier: str, k:
     model.fit(X_tr, y_tr)
     pred = model.predict(X_te)
     return model, X_te, y_te, pred
+
+
+@st.cache_data(show_spinner="교차 검증 중...")
+def cross_validate(n_trees: int, n_folds: int, drop_dup: bool, outlier: str, k: float):
+    data = preprocess(load_data(), drop_dup, outlier, k)
+    X, y = data[SENSORS], data["Class"].astype(int)
+    rf = RandomForestClassifier(n_estimators=n_trees, random_state=42, n_jobs=-1)
+    return cross_val_score(rf, X, y, cv=n_folds, scoring="accuracy")
 
 
 def polar_chart(values: pd.Series, title: str) -> go.Figure:
@@ -353,6 +361,7 @@ def simulate_model_drive(grid, unit_m, vmin, vmax, orient, max_moves, prep_key):
     heading = d * 90.0
     visited, stack = {start}, [start]
     frames = []  # (x, y, heading, 실행 Class, 비고)
+    crossroads = []  # 갈림길 선택 기록
 
     def add(x, y, h, cls, note=""):
         frames.append((x, y, h, cls, note))
@@ -382,6 +391,13 @@ def simulate_model_drive(grid, unit_m, vmin, vmax, orient, max_moves, prep_key):
             note = "" if nd == ranked[0] else "벽·지나온 길이라 다음 순위 선택"
             stack.append((nr, nc))
             visited.add((nr, nc))
+            if len(ok) >= 2:
+                ct = "직진" if nd == d else ("우회전" if nd == (d + 1) % 4 else "좌회전")
+                crossroads.append({"이동": moves + 1, "선택지": len(ok), "선택": ct,
+                                   "1순위 선택": nd == ranked[0],
+                                   "P(직진)": round(p[0], 3),
+                                   "P(우회전)": round(p[1] + p[2], 3),
+                                   "P(좌회전)": round(p[3], 3)})
         else:  # 막다른 길 → 왔던 칸으로 되돌아감
             stack.pop()
             if not stack:
@@ -418,7 +434,8 @@ def simulate_model_drive(grid, unit_m, vmin, vmax, orient, max_moves, prep_key):
                     "실행 Class": cls, "실행 움직임": CLASS_KO[cls], "비고": note})
         row.update({f"P({k})": round(p[k - 1], 3) for k in (1, 2, 3, 4)})
         rows.append(row)
-    return pd.DataFrame(rows), reached, moves
+    cross_out = pd.DataFrame(crossroads) if crossroads else pd.DataFrame()
+    return pd.DataFrame(rows), reached, moves, cross_out
 
 
 def maze_animation(grid, sim_df, unit_m, orient, title, cls_col):
@@ -513,7 +530,7 @@ except Exception as e:  # noqa: BLE001
     st.error(f"데이터를 불러오지 못했어요: {e}")
     st.stop()
 
-page = st.sidebar.radio("화면", ["데이터 소개", "상관관계", "전처리", "움직임 분류", "미로 시뮬레이션"])
+page = st.sidebar.radio("화면", ["데이터 소개", "상관관계", "전처리", "움직임 분류", "미로 시뮬레이션", "데이터 평가"])
 st.sidebar.caption(f"[데이터 출처 (Kaggle)]({SOURCE_URL})")
 
 # 1) 데이터 소개 ------------------------------------------------------
@@ -766,7 +783,7 @@ elif page == "움직임 분류":
                         width="stretch")
 
 # 5) 미로 시뮬레이션 --------------------------------------------------
-else:
+elif page == "미로 시뮬레이션":
     st.header("🧩 미로 속 로봇 시뮬레이션")
     st.markdown(
         "무작위 미로에서 로봇이 **왼쪽 위(출발) → 오른쪽 아래(도착)** 로 갑니다. "
@@ -829,7 +846,7 @@ else:
         st.plotly_chart(fig, width="stretch")
 
     with tab2:
-        drive_df, reached, moves = simulate_model_drive(grid, unit_m, vmin, vmax, orient, max_steps, prep_key)
+        drive_df, reached, moves, cross_df = simulate_model_drive(grid, unit_m, vmin, vmax, orient, max_steps, prep_key)
         st.caption("갈림길마다 모델 확률을 방향 점수로 써요 — 직진 = P(1), 오른쪽 = P(2)+P(3), 왼쪽 = P(4). "
                    "벽이 있는 칸으로는 가지 않고, 지나온 길은 피하며, 막다른 길이면 되돌아가요.")
         if reached:
@@ -851,3 +868,105 @@ else:
         )
         st.subheader("이동 기록 df")
         st.dataframe(drive_df, hide_index=True, width="stretch", height=320)
+
+        # ── 갈림길 선택 경향 ──
+        if not cross_df.empty:
+            st.subheader("갈림길 선택 경향")
+            st.caption(f"갈림길(선택 가능한 방향 2개 이상) {len(cross_df)}곳에서의 선택 분석")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                choice_cnt = cross_df["선택"].value_counts().reset_index()
+                choice_cnt.columns = ["선택", "횟수"]
+                fig = px.pie(choice_cnt, names="선택", values="횟수",
+                             title="갈림길에서의 방향 선택 비율",
+                             color_discrete_sequence=px.colors.qualitative.Set2)
+                fig.update_layout(height=360)
+                st.plotly_chart(fig, width="stretch")
+            with cc2:
+                first_rate = cross_df["1순위 선택"].mean() * 100
+                st.metric("모델 1순위 예측대로 간 비율", f"{first_rate:.1f}%")
+                prob_avg = cross_df[["P(직진)", "P(우회전)", "P(좌회전)"]].mean()
+                prob_df = pd.DataFrame({"방향": ["직진", "우회전", "좌회전"],
+                                        "평균 확률": prob_avg.values})
+                fig = px.bar(prob_df, x="방향", y="평균 확률", text_auto=".3f",
+                             title="갈림길에서의 평균 예측 확률",
+                             color="방향",
+                             color_discrete_map={"직진": "#2E86DE", "우회전": "#E74C3C", "좌회전": "#27AE60"})
+                fig.update_layout(height=300, yaxis_range=[0, 1], showlegend=False)
+                st.plotly_chart(fig, width="stretch")
+            with st.expander("갈림길 상세 기록"):
+                st.dataframe(cross_df, hide_index=True, width="stretch")
+        else:
+            st.info("이 미로에서는 갈림길이 없었어요.")
+
+# 6) 데이터 평가 --------------------------------------------------------
+else:
+    st.header("📊 데이터 평가")
+    prep = get_prep()
+    st.caption(
+        f"전처리: 중복 제거 {'O' if prep['drop_dup'] else 'X'} · 이상치 {prep['outlier']}"
+        + ("" if prep["outlier"] == OUTLIER_MODES[0] else f" (k={prep['k']})")
+    )
+
+    c1, c2 = st.columns(2)
+    eval_test = c1.slider("시험용 데이터 비율", 0.1, 0.5, 0.2, 0.05, key="eval_test")
+    eval_trees = c2.slider("나무 개수", 10, 300, 100, 10, key="eval_trees")
+
+    model, X_te, y_te, pred = train_model(
+        eval_test, eval_trees, prep["drop_dup"], prep["outlier"], prep["k"]
+    )
+
+    # ── 1. 정밀도 · 재현율 · F1 ──
+    st.subheader("1. 클래스별 정밀도 · 재현율 · F1 스코어")
+    eval_labels = [1, 2, 3, 4]
+    prec, rec, f1, sup = precision_recall_fscore_support(y_te, pred, labels=eval_labels)
+
+    metrics_df = pd.DataFrame({
+        "Class": eval_labels,
+        "움직임": [CLASS_KO[c] for c in eval_labels],
+        "정밀도 (Precision)": prec.round(4),
+        "재현율 (Recall)": rec.round(4),
+        "F1 스코어": f1.round(4),
+        "데이터 수": sup,
+    })
+    st.dataframe(metrics_df, hide_index=True, width="stretch")
+
+    melted = metrics_df.melt(
+        id_vars=["움직임"],
+        value_vars=["정밀도 (Precision)", "재현율 (Recall)", "F1 스코어"],
+        var_name="지표", value_name="값",
+    )
+    fig = px.bar(melted, x="움직임", y="값", color="지표", barmode="group",
+                 text_auto=".3f", title="클래스별 성능 지표 비교")
+    fig.update_layout(height=420, yaxis_range=[0, 1.08])
+    st.plotly_chart(fig, width="stretch")
+
+    acc = accuracy_score(y_te, pred)
+    macro_f1 = float(f1.mean())
+    weighted_f1 = float((f1 * sup).sum() / sup.sum())
+    o1, o2, o3 = st.columns(3)
+    o1.metric("정확도 (Accuracy)", f"{acc * 100:.2f}%")
+    o2.metric("매크로 F1 (평균)", f"{macro_f1:.4f}")
+    o3.metric("가중 F1 (Weighted)", f"{weighted_f1:.4f}")
+
+    # ── 2. 교차 검증 ──
+    st.subheader("2. 교차 검증 (K-Fold Cross Validation)")
+    st.caption("데이터를 K등분해 돌아가며 시험용으로 쓰고 나머지로 학습해요. 한 번 나눈 결과가 우연이 아닌지 확인할 수 있어요.")
+    n_folds = st.slider("K (폴드 수)", 3, 10, 5, key="eval_folds")
+
+    scores = cross_validate(eval_trees, n_folds, prep["drop_dup"], prep["outlier"], prep["k"])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("평균 정확도", f"{scores.mean() * 100:.2f}%")
+    m2.metric("표준편차", f"±{scores.std() * 100:.2f}%")
+    m3.metric("최저 ~ 최고", f"{scores.min() * 100:.1f}% ~ {scores.max() * 100:.1f}%")
+
+    fold_df = pd.DataFrame({"폴드": [f"{i + 1}" for i in range(n_folds)], "정확도": scores})
+    fig = px.bar(fold_df, x="폴드", y="정확도", text_auto=".4f", title="폴드별 정확도")
+    fig.add_hline(y=scores.mean(), line_dash="dash", line_color="red",
+                  annotation_text=f"평균 {scores.mean():.4f}")
+    fig.update_layout(height=380, yaxis_range=[max(0, scores.min() - 0.03), 1.0])
+    st.plotly_chart(fig, width="stretch")
+
+    with st.expander("폴드별 수치 보기"):
+        st.dataframe(fold_df, hide_index=True, width="stretch")
